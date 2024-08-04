@@ -55,8 +55,6 @@ region_name=$(echo "${best_gpu}" | jq -r '.regions_with_capacity_available[0].na
 
 echo "spinning up $instance_type in $region_name"
 
-exit 0
-
 instance_id=$(
 {
 tee /dev/stderr <<EOF
@@ -77,10 +75,12 @@ EOF
 echo "launched instance $instance_id"
 echo
 
+set +x
+
 # wait for instance to be done booting
 while true ; do
   instance_data=$(
-    curl --fail --silent -u "${API_KEY}" "${API_URL}/instances/${instance_id}"
+    curl --fail --silent -u "${API_KEY}" "${API_URL}/instances/${instance_id}" \
     | tee /dev/stderr \
     | jq .data
   )
@@ -93,36 +93,46 @@ while true ; do
   echo -n .
 done
 
-instance_ip=$(echo "${instance_data}" | jq -r .ip))
+set -x
+
+instance_ip=$(echo "${instance_data}" | jq -r .ip )
 
 echo "ready at $instance_ip"
 
-# copy inputs to over, in background
+# copy inputs over, in background
+# TODO: manage stderr/stdout
 scp ${@} ubuntu@${instance_ip}:~/ &
 
 # setup instance to run fast and high quality Whisper transcription
 # see https://github.com/Vaibhavs10/insanely-fast-whisper
-ssh ubuntu@${instance_ip} <<EOF
-sudo apt install pipx jq
+ssh -o "StrictHostKeyChecking no" ubuntu@${instance_ip} <<EOF
+sudo apt -o Apt::Get::Assume-Yes=true install pipx jq
 pipx install insanely-fast-whisper
 pipx runpip insanely-fast-whisper install flash-attn --no-build-isolation
 EOF
 
 # wait for background upload to be done
+echo "waiting for input(s) to be uploaded"
 wait
 
 # run transcription on cloud GPU instance
 for f in "${@}" ; do
+  echo "transcribe ${f}"
+
   bf=$(basename "$f")
-  ssh ubuntu@${instance_ip} \
+  of=$(dirname "$f")/transcript-$bf.json
+
+  ssh -o "StrictHostKeyChecking no" ubuntu@${instance_ip} <<EOF
     insanely-fast-whisper \
     --file-name "$bf" \
     --flash True \
     ${HF_TOKEN:+--hf-token ${HF_TOKEN}} \
     --transcript-path "transcript-$bf.json"
+EOF
 
   # copy transcription output back to local machine
-  scp ubuntu@${instance_ip}:~/transcript-$bf.json" "$(dirname "$f")/transcript-$bf.json"
+  scp ubuntu@${instance_ip}:~/transcript-$bf.json" "$of"
+  echo "saved output as $of"
 fi
 
 echo "terminating $instance_id"
